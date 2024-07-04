@@ -80,14 +80,15 @@ class DecodedMessage:
 class Type:
     __slots__ = (
         'name', 'primitiveType', 'presence', 'semanticType',
-        'description', 'length', 'characterEncoding', 'nullValue')
+        'description', 'length', 'padding', 'characterEncoding', 'nullValue')
 
     name: str
     primitiveType: PrimitiveType
     presence: Presence
     semanticType: Optional[str]
     description: Optional[str]
-    length: int
+    length: int     # For strings
+    padding: int    # Preceeding this primitive
     characterEncoding: Optional[CharacterEncoding]
     nullValue: Optional[Union[str, int, float]]
 
@@ -97,6 +98,7 @@ class Type:
         self.primitiveType = primitiveType
         self.presence = Presence.REQUIRED
         self.length = 1
+        self.padding = 0
         self.characterEncoding = None
         if nullValue is not None:
             if primitiveType == PrimitiveType.CHAR:
@@ -234,6 +236,19 @@ class Composite:
     types: List[Union['Composite', Type]] = field(default_factory=list)
     description: Optional[str] = None
 
+    def size(self):
+        sz = 0
+        for t in self.types:
+            if isinstance(t, Type):
+                if t.primitiveType == PrimitiveType.CHAR:
+                    sz += type_.length
+                else:
+                    sz += FORMAT_SIZES[t.primitiveType]
+            else:
+                assert(isinstance(t, Composite))
+                sz += t.size()
+        return sz
+
     def __repr__(self):
         return f"<Composite '{self.name}'>"
 
@@ -253,12 +268,11 @@ class Set:
 
     def decode(self, val: int) -> List[str]:
         if isinstance(self.encodingType, SetEncodingType):
-            length = FORMAT_SIZES[PrimitiveType[self.encodingType.value]] * 8
+            length = FORMAT_SIZES[PrimitiveType[self.encodingType.name]] * 8
         else:
             length = FORMAT_SIZES[self.encodingType.primitiveType] * 8
 
-        bits = bitstring.Bits(uint=val, length=length)
-        return [self.choices[i].name for i, v in enumerate(bits) if v]
+        return [c.name for c in self.choices if (1 << c.value) & val]
 
     def __repr__(self):
         return f"<Set '{self.name}'>"
@@ -579,6 +593,10 @@ def _unpack_format(
     elif isinstance(type_, Type):
         if type_.presence == Presence.CONSTANT:
             return ''
+        if type_.padding > 0:
+            if buffer_cursor:
+                buffer_cursor.val += type_.padding
+            prefix += str(type_.padding) + 'x'
         if type_.primitiveType == PrimitiveType.CHAR:
             if buffer_cursor:
                 buffer_cursor.val += type_.length
@@ -591,7 +609,7 @@ def _unpack_format(
     elif isinstance(type_, (Set, Enum)):
         if type_.presence == Presence.CONSTANT:
             return ''
-        if isinstance(type_.encodingType, (PrimitiveType, EnumEncodingType)):
+        if isinstance(type_.encodingType, (PrimitiveType, EnumEncodingType, SetEncodingType)):
             if type_.encodingType.value in PRIMITIVE_TYPES:
                 if buffer_cursor:
                     buffer_cursor.val += FORMAT_SIZES[PrimitiveType(type_.encodingType.value)]
@@ -778,8 +796,9 @@ def _walk_fields_wrap_composite(
             _walk_fields_wrap_composite(schema, rv1, t, cursor)
             rv[t.name] = WrappedComposite(t.name, rv1, None, offset)
 
-        else:
+        elif t.presence != Presence.CONSTANT:
             t1 = t.primitiveType
+            cursor.val += t.padding
             if t1 == PrimitiveType.CHAR and t.length > 1:
                 rv[t.name] = Pointer(cursor.val, str(t.length) + "s", t.length)
                 cursor.val += t.length
@@ -837,6 +856,8 @@ def _walk_fields_wrap(
                 cursor.val - cursor0)
 
         elif isinstance(f.type, Type):
+            if f.type.presence == Presence.CONSTANT:
+                continue
             t = f.type.primitiveType
             if t == PrimitiveType.CHAR and f.type.length > 1:
                 rv[f.name] = Pointer(cursor.val, str(f.type.length) + "s", f.type.length)
@@ -1004,6 +1025,8 @@ def _parse_schema(f: TextIO) -> Schema:
                     x.semanticType = attrs['semanticType']
                 if 'presence' in attrs:
                     x.presence = PRESENCE_TYPES[attrs['presence']]
+                if 'offset' in attrs:
+                    x.padding = int(attrs['offset']) - stack[-1].size()
 
                 stack.append(x)
 
@@ -1061,7 +1084,7 @@ def _parse_schema(f: TextIO) -> Schema:
         elif tag == "choice":
             if action == "start":
                 attrs = dict(elem.items())
-                stack.append(SetChoice(name=attrs['name'], value=elem.text.strip()))
+                stack.append(SetChoice(name=attrs['name'], value=int(elem.text.strip())))
 
             elif action == "end":
                 x = stack.pop()
